@@ -1,0 +1,454 @@
+import os
+import re
+import time
+import datetime
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+
+
+# 1) Configuration
+
+BASE_DIR = r"C:\Users\ander\Webscraping"
+TICKERS_EXCEL = os.path.join(BASE_DIR, "Tickers.xlsx")
+OUTPUT_DIR = os.path.join(BASE_DIR, "ipo_filings_html2024")
+
+HEADERS = {
+    "User-Agent": "MyScraper youremail@domain.com",
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "www.sec.gov"
+}
+
+TARGET_SECTIONS = ["SUMMARY", "RISK FACTORS", "USE OF PROCEEDS"]
+
+BOUNDARY_HEADINGS = {
+    "PROSPECTUS SUMMARY",
+    "RISK FACTORS",
+    "USE OF PROCEEDS",
+    "CAUTIONARY NOTE REGARDING FORWARD-LOOKING STATEMENTS",
+    "CAUTIONARY STATEMENT REGARDING FORWARD-LOOKING STATEMENTS",
+    "SPECIAL NOTE REGARDING FORWARD-LOOKING STATEMENTS",
+    "DIVIDEND POLICY",
+    "CAPITALIZATION",
+    "SELECTED FINANCIAL DATA",
+    "SELECTED CONSOLIDATED FINANCIAL DATA",
+    "MANAGEMENT’S DISCUSSION AND ANALYSIS OF FINANCIAL CONDITION AND RESULTS OF OPERATIONS",
+    "MANAGEMENT'S DISCUSSION AND ANALYSIS OF FINANCIAL CONDITION AND RESULTS OF OPERATIONS",
+    "EXECUTIVE COMPENSATION",
+    "CERTAIN RELATIONSHIPS AND RELATED PARTY TRANSACTIONS",
+    "RELATED PARTY TRANSACTIONS",
+    "PRINCIPAL STOCKHOLDERS",
+    "SECURITY OWNERSHIP OF CERTAIN BENEFICIAL OWNERS AND MANAGEMENT",
+    "DESCRIPTION OF CAPITAL STOCK",
+    "DESCRIPTION OF SECURITIES",
+    "SHARES ELIGIBLE FOR FUTURE SALE",
+    "PLAN OF DISTRIBUTION",
+    "UNDERWRITING",
+    "LEGAL MATTERS",
+    "WHERE YOU CAN FIND MORE INFORMATION",
+    "ADDITIONAL INFORMATION",
+    "INDEX TO CONSOLIDATED FINANCIAL STATEMENTS",
+    "MARKET AND INDUSTRY DATA",
+    "CERTAIN UNITED STATES FEDERAL INCOME TAX CONSIDERATIONS",
+    "PLAN OF OPERATION",
+    "GOVERNMENT REGULATION",
+    "MANAGEMENT’S DISCUSSION AND ANALYSIS OF RESULTS OF OPERATIONS AND FINANCIAL CONDITION",
+    "CERTAIN MATERIAL U.S. FEDERAL INCOME TAX CONSIDERATIONS",
+    "INDEMNIFICATION",
+    "QUANTITATIVE AND QUALITATIVE DISCLOSURES ABOUT MARKET RISK",
+    "REGULATORY ENVIRONMENT",
+    "DESCRIPTION OF OUR CAPITAL STOCK",
+    "MANAGEMENT’S DISCUSSION OF FINANCIAL CONDITION AND RESULTS OF OPERATIONS",
+}
+
+# 2) Utility: create directory if missing
+
+def create_directory(dir_path):
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+
+# 3) We'll fetch earliest EXACT "S-1." If none, earliest EXACT "F-1."
+
+def fetch_s1_or_f1_html(cik):
+    """
+    Try earliest EXACT S-1. If none found, earliest EXACT F-1.
+    Return doc HTML or None
+    """
+    s1_html = fetch_formtype_earliest(cik, "S-1")
+    if s1_html:
+        return s1_html
+    return fetch_formtype_earliest(cik, "F-1")
+
+def fetch_formtype_earliest(cik, form_type="S-1"):
+    """
+    Gathers all EXACT matches for form_type in the index, parse date, pick earliest.
+    """
+    base_url = "https://www.sec.gov/cgi-bin/browse-edgar"
+    url = f"{base_url}?action=getcompany&CIK={cik}&type={form_type}&owner=exclude&count=100"
+    print(f"Index for CIK={cik}, form={form_type} => {url}")
+
+    resp = requests.get(url, headers=HEADERS)
+    if resp.status_code != 200:
+        print(f"Error {resp.status_code} from SEC index for {cik}")
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table", {"class": "tableFile2"})
+    if not table:
+        print(f"No tableFile2 => no {form_type} for {cik}")
+        return None
+
+    rows = table.find_all("tr")
+    all_filings = []
+    for i, row in enumerate(rows[1:], start=1):
+        cols = row.find_all("td")
+        if len(cols) < 4:
+            continue
+        found_form = cols[0].get_text(strip=True)
+        if found_form == form_type:
+            date_str = cols[3].get_text(strip=True)
+            filing_date = try_parse_date(date_str)
+            if not filing_date:
+                continue
+            link_tag = cols[1].find("a")
+            if link_tag and link_tag.get("href"):
+                detail_link = "https://www.sec.gov" + link_tag["href"]
+                all_filings.append((filing_date, detail_link))
+
+    if not all_filings:
+        print(f"No EXACT {form_type} found for {cik}")
+        return None
+
+    # sort ascending by date
+    all_filings.sort(key=lambda x: x[0])
+    earliest_date, earliest_link = all_filings[0]
+    print(f"Earliest EXACT {form_type} for {cik} => {earliest_date.date()} => {earliest_link}")
+    return fetch_main_doc_html(earliest_link)
+
+def try_parse_date(date_str):
+    """
+    Attempt multiple known formats:
+      - %m/%d/%Y  (like '06/09/2021')
+      - %Y-%m-%d  (like '2021-06-09')
+    Return a datetime object or None if all fail
+    """
+    fmts = ["%m/%d/%Y", "%Y-%m-%d"]
+    for fmt in fmts:
+        try:
+            return datetime.datetime.strptime(date_str, fmt)
+        except ValueError:
+            pass
+    return None
+
+def fetch_main_doc_html(index_url):
+    """
+    In the Documents page, find row whose doc_type is EXACT "S-1" or EXACT "F-1"
+    """
+    r = requests.get(index_url, headers=HEADERS)
+    if r.status_code != 200:
+        print(f"Error {r.status_code} fetching detail page: {index_url}")
+        return None
+
+    if "-index.htm" in index_url.lower():
+        soup = BeautifulSoup(r.text, "html.parser")
+        doc_table = soup.find("table", class_="tableFile", summary="Document Format Files")
+        if not doc_table:
+            return None
+
+        rows = doc_table.find_all("tr")
+        for i, row in enumerate(rows[1:], start=1):
+            cols = row.find_all("td")
+            if len(cols) < 4:
+                continue
+            doc_type_txt = cols[3].get_text(strip=True)
+            if doc_type_txt in ("S-1", "F-1"):
+                link_tag = cols[2].find("a")
+                if link_tag and link_tag.get("href"):
+                    doc_url = "https://www.sec.gov" + link_tag["href"]
+                    doc_resp = requests.get(doc_url, headers=HEADERS)
+                    if doc_resp.status_code == 200:
+                        return doc_resp.text
+        return None
+    else:
+        return r.text
+
+
+# 4) remove <table>
+
+def remove_tables(soup):
+    for tbl in soup.find_all("table"):
+        tbl.decompose()
+
+
+# 5) skip line logic
+
+
+def skip_line(line_stripped):
+    # 1. Skip if empty
+    if not line_stripped:
+        return True
+
+    # 2. Skip lines referencing "table of contents"
+    if "table of contents" in line_stripped.lower():
+        return True
+
+    # 3. Skip lines that match the dotted page format (common in TOCs), e.g. "SUMMARY .......... 3"
+    if re.search(r'\.{5,}\s*\d+$', line_stripped):
+        return True
+
+    # 4. Skip lines that explicitly reference "page <number>"
+    if re.search(r'page\s+\d+', line_stripped.lower()):
+        return True
+
+    # 5. Skip lines with phrases like "begins on page" or "see page"
+    if "begins on page" in line_stripped.lower():
+        return True
+    if "see page" in line_stripped.lower():
+        return True
+
+    # Otherwise, do not skip
+    return False
+
+# 6) heading detection
+
+
+
+def line_is_fully_quoted(line_str):
+    """
+    Returns True if the entire (stripped) line is enclosed in a single pair of
+    quotes (straight or curly). For example:
+        "RISK FACTORS"
+        'Underwriting'
+        “RISK FACTORS”
+    """
+    s = line_str.strip()
+    if len(s) < 2:
+        return False
+    
+   
+    left_quotes  = ('"', "'", "“", "‘")
+    right_quotes = ('"', "'", "”", "’")
+    first_char, last_char = s[0], s[-1]
+
+   
+    if first_char in left_quotes and last_char in right_quotes:
+        
+        pairs = {
+            '"': '"',
+            "'": "'",
+            "“": "”",
+            "‘": "’",
+        }
+       
+        return True
+
+    return False
+
+### NEW / MODIFIED ###
+def strip_surrounding_quotes(line_str):
+    """
+    If line_str is fully quoted, strip the first and last character (the quotes).
+    Else, return the line as-is.
+    """
+    if line_is_fully_quoted(line_str):
+        return line_str.strip()[1:-1].strip()
+    else:
+        return line_str.strip()
+
+def is_capitalized_in_any_way(s):
+    """
+    Returns True if:
+      1) The entire string (ignoring spaces) is uppercase (e.g. RISK FACTORS)
+         OR
+      2) Each 'word' is 'title-cased' (first letter uppercase, rest lower),
+         e.g. "Underwriting Discounts" or "Risk Factors".
+    """
+    no_spaces = s.replace(" ", "")
+    if no_spaces.isupper():
+        return True
+
+    words = s.split()
+    for w in words:
+        if not w:  # skip empty
+            continue
+        # first character uppercase, the rest lowercase
+        if not w[0].isupper():
+            return False
+        if len(w) > 1 and not w[1:].islower():
+            return False
+    return True
+
+### NEW / MODIFIED ###
+def is_line_heading(line_str):
+    """
+    Returns True if:
+      - The entire line is fully quoted or not quoted,
+        but after optional quotes are stripped, it is
+        capitalized/title-case, and it matches (or starts with)
+        one of our BOUNDARY_HEADINGS.
+      - No extra text beyond the heading itself.
+    """
+    # 1. Strip leading/trailing whitespace
+    s = line_str.strip()
+    if not s:
+        return False
+
+    # 2. If fully quoted, remove the quotes before checking
+    if line_is_fully_quoted(s):
+        s = strip_surrounding_quotes(s)
+
+    # 3. Check that the *inside* is capitalized in any way
+    if not is_capitalized_in_any_way(s):
+        return False
+
+    # 4. Remove trailing punctuation like "." or ":" for better matching
+    s_stripped_punct = re.sub(r'[.:]+$', '', s.strip())
+    s_up = s_stripped_punct.upper()
+
+    # 5. Check if s_up is exactly or starts with an entry in BOUNDARY_HEADINGS
+    for heading in BOUNDARY_HEADINGS:
+        # e.g. "RISK FACTORS" or "RISK FACTORS AND SOMETHING"
+        if s_up == heading or s_up.startswith(heading + " "):
+            return True
+
+    return False
+
+### NEW / MODIFIED ###
+def identify_target_heading(line_str):
+    """
+    If the line is recognized as a heading, decide which target it is.
+    We do a simpler match (similar logic: uppercase, strip punctuation).
+    """
+    up = line_str.upper().strip()
+    up = re.sub(r'[.:]+$', '', up)
+
+    if "PROSPECTUS SUMMARY" in up or up == "SUMMARY":
+        return "SUMMARY"
+    if up.startswith("RISK FACTORS"):
+        return "RISK FACTORS"
+    if up.startswith("USE OF PROCEEDS"):
+        return "USE OF PROCEEDS"
+    return None
+
+
+# 7) main extraction
+
+def extract_target_sections(raw_html):
+    if not raw_html:
+        return {}
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+    remove_tables(soup)
+
+    text = soup.get_text("\n")
+    raw_lines = text.splitlines()
+
+    # Filter out lines we always skip
+    lines = []
+    for ln in raw_lines:
+        st = ln.strip()
+        if skip_line(st):
+            continue
+        lines.append(ln)
+
+    sections_map = {
+        "SUMMARY": [],
+        "RISK FACTORS": [],
+        "USE OF PROCEEDS": []
+    }
+    current_sec = None
+
+    for line in lines:
+        st = line.strip()
+
+        # Check if this is a heading line
+        if is_line_heading(st):
+            found_target = identify_target_heading(st)
+            if found_target:
+                current_sec = found_target
+                sections_map[current_sec].append(line)
+            else:
+                # It's a known heading in BOUNDARY_HEADINGS but not a target
+                current_sec = None
+        else:
+            # Normal text line—if we are inside a target section, add it
+            if current_sec:
+                sections_map[current_sec].append(line)
+
+    # Combine lines for each target, but only keep if length is meaningful
+    final_map = {}
+    for sec in TARGET_SECTIONS:
+        combined = "\n".join(sections_map[sec]).strip()
+        if len(combined) < 300:
+            final_map[sec] = ""
+        else:
+            final_map[sec] = combined
+    return final_map
+
+def lines_to_paragraphs(big_text):
+    lines = big_text.splitlines()
+    paragraphs = []
+    curr_p = []
+    for ln in lines:
+        st = ln.strip()
+        if not st:
+            if curr_p:
+                paragraphs.append(" ".join(curr_p))
+                curr_p = []
+        else:
+            curr_p.append(st)
+    if curr_p:
+        paragraphs.append(" ".join(curr_p))
+    return paragraphs
+
+def save_sections_html(outfile, ticker, cik, sections):
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("<html><body>\n")
+        f.write(f"<h1>{ticker} (CIK={cik})</h1>\n")
+        for sec in TARGET_SECTIONS:
+            content = sections[sec]
+            if content.strip():
+                f.write(f"<h2>{sec}</h2>\n")
+                paragraphs = lines_to_paragraphs(content)
+                for p in paragraphs:
+                    f.write(f"<p>{p}</p>\n")
+        f.write("</body></html>\n")
+    print("Saved =>", outfile)
+
+# main
+
+
+def main():
+    create_directory(OUTPUT_DIR)
+
+    if not os.path.isfile(TICKERS_EXCEL):
+        print("Tickers.xlsx not found =>", TICKERS_EXCEL)
+        return
+
+    df = pd.read_excel(TICKERS_EXCEL)
+    df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
+    df["CIK"] = df["CIK"].astype(str).str.strip()
+
+    for idx, row in df.iterrows():
+        ticker = row["Ticker"]
+        cik_raw = row["CIK"]
+        try:
+            cik = str(int(cik_raw)).zfill(10)
+        except ValueError:
+            print(f"[{idx}] Invalid CIK => {cik_raw}")
+            continue
+
+        print(f"[{idx}] Ticker={ticker}, CIK={cik}")
+        doc_html = fetch_s1_or_f1_html(cik)
+        if not doc_html:
+            print("No doc found or error, skipping.")
+            time.sleep(0.15)
+            continue
+
+        sections_map = extract_target_sections(doc_html)
+        out_file = os.path.join(OUTPUT_DIR, f"{ticker}.html")
+        save_sections_html(out_file, ticker, cik, sections_map)
+        time.sleep(0.15)
+
+if __name__ == "__main__":
+    main()
