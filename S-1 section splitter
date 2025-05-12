@@ -1,0 +1,91 @@
+import os
+import glob
+from bs4 import BeautifulSoup
+
+def extract_sections_from_html(html_path):
+    """
+    Læser en HTML-fil, finder (baseret på heading-tekst):
+      - Summary
+      - Risk Factors
+      - Use of Proceeds
+    og returnerer HTML-indholdet som en dict { 'summary': ..., 'risk_factors': ..., 'use_of_proceeds': ... }.
+    """
+    with open(html_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    soup = BeautifulSoup(content, 'html.parser')
+    
+
+    summary_header = soup.find(lambda tag: tag.name in ['h1','h2','h3','h4','h5','h6']
+                               and 'summary' in tag.get_text(strip=True).lower())
+    risk_header = soup.find(lambda tag: tag.name in ['h1','h2','h3','h4','h5','h6']
+                            and 'risk factors' in tag.get_text(strip=True).lower())
+    proceeds_header = soup.find(lambda tag: tag.name in ['h1','h2','h3','h4','h5','h6']
+                                and 'use of proceeds' in tag.get_text(strip=True).lower())
+    
+    def get_section_html(start_header, end_header):
+        """
+        Returnerer al HTML (inkl. start_header) fra start_header frem til (men ekskl.) end_header.
+        Hvis end_header er None, returneres alt frem til dokumentets slutning.
+        """
+        if not start_header:
+            return ""  
+        
+       
+        section_parts = [str(start_header)]
+        
+      
+        cur = start_header.next_sibling
+        while cur and cur != end_header:
+            section_parts.append(str(cur))
+            cur = cur.next_sibling
+        
+        return "".join(section_parts)
+    
+   
+    summary_html = get_section_html(summary_header, risk_header)
+    risk_html    = get_section_html(risk_header, proceeds_header)
+    proceeds_html = ""
+    
+   
+    if proceeds_header:
+        proceeds_html = get_section_html(proceeds_header, None)
+    
+    sections = {
+        'summary': summary_html,
+        'risk_factors': risk_html,
+        'use_of_proceeds': proceeds_html
+    }
+    
+    return sections
+
+
+def main(input_folder, output_folder):
+    """
+    Gennemgår alle .html-filer i input_folder og splitter dem i 3 sektioner.
+    Gemmer hver sektion som en .html-fil i output_folder.
+    """
+    os.makedirs(output_folder, exist_ok=True)
+    
+    html_files = glob.glob(os.path.join(input_folder, '*.html'))
+    
+    for html_file in html_files:
+        base_name = os.path.splitext(os.path.basename(html_file))[0]
+        
+        sections = extract_sections_from_html(html_file)
+        
+        # Gemmer hver sektion som .html
+        for section_name, html_content in sections.items():
+            out_path = os.path.join(output_folder, f"{base_name}_{section_name}.html")
+            with open(out_path, 'w', encoding='utf-8') as out_f:
+                out_f.write(html_content)
+        
+        print(f"Færdig med at splitte: {html_file}")
+
+
+if __name__ == "__main__":
+  
+    input_dir = r"C:\Users\ander\Webscraping\ipo_filings_html2024"
+    output_dir = r"C:\Users\ander\Webscraping\split_ipo_filings_html2024"
+    
+    main(input_dir, output_dir)
