@@ -1,0 +1,443 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re  # For regex pattern matching
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV, RepeatedStratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, precision_score, recall_score, 
+    f1_score, roc_auc_score, confusion_matrix, classification_report, 
+    roc_curve
+)
+from sklearn.inspection import permutation_importance
+
+# Try to import shap if available, otherwise skip SHAP analysis
+try:
+    import shap
+    shap_available = True
+except ImportError:
+    shap_available = False
+    print("SHAP package not available. SHAP analysis will be skipped.")
+
+import warnings
+warnings.filterwarnings('ignore')
+
+print("Loading and preprocessing data...")
+
+# 1. Load data from Excel
+try:
+    data = pd.read_excel("final ML model .xlsx")
+    print(f"Successfully loaded data from Excel file")
+except Exception as e:
+    print(f"Error loading Excel file: {e}")
+    raise
+
+# 2. Print basic information about the dataset
+print(f"Dataset shape: {data.shape}")
+
+# Check for the target column
+target_col_pattern = "New.*underpricing.*classification"
+target_cols = [col for col in data.columns if re.search(target_col_pattern, col, re.IGNORECASE)]
+
+if target_cols:
+    target_col = target_cols[0]
+    print(f"Found target column: '{target_col}'")
+    print(f"Number of unique values in target: {data[target_col].nunique()}")
+    print(f"Target value counts: \n{data[target_col].value_counts()}")
+else:
+    print("Warning: Could not find target column matching 'New underpricing classification'")
+    print("Available columns:")
+    for col in data.columns:
+        print(f"- {col}")
+
+# 3. Clean data - remove specified columns
+# Print column names to see exact format
+print("Actual column names in the dataset:")
+for col in data.columns:
+    print(f"- '{col}'")
+
+# Define columns to drop (approximately)
+columns_to_drop_patterns = [
+    "Issuer/Borrower.*Name",
+    "Ticker.*Symbol",
+    "Book Or Co-Managers"
+]
+
+# Add pattern for stock price 2 weeks after
+stock_price_pattern = "Stock Price.*Week"
+stock_price_cols = [col for col in data.columns if re.search(stock_price_pattern, col, re.IGNORECASE)]
+if stock_price_cols:
+    print(f"Found Stock Price column to drop: {stock_price_cols}")
+    columns_to_drop_patterns.append(stock_price_pattern)
+else:
+    # Try an alternative pattern if the first one didn't match
+    alternative_pattern = ".*Weeks After.*Offer.*"
+    alt_stock_price_cols = [col for col in data.columns if re.search(alternative_pattern, col, re.IGNORECASE)]
+    if alt_stock_price_cols:
+        print(f"Found Stock Price column with alternative pattern: {alt_stock_price_cols}")
+        columns_to_drop_patterns.append(alternative_pattern)
+    else:
+        print("WARNING: Could not find the Stock Price 2 Weeks After column!")
+        print("Please manually check the column names above and remove it after identifying the exact name.")
+
+# Find matching columns
+columns_to_drop = []
+for pattern in columns_to_drop_patterns:
+    matches = [col for col in data.columns if re.search(pattern, col, re.IGNORECASE)]
+    columns_to_drop.extend(matches)
+
+print(f"\nColumns to be dropped: {columns_to_drop}")
+
+# Drop the identified columns
+if columns_to_drop:
+    data.drop(columns=columns_to_drop, inplace=True)
+    print(f"Dataset shape after dropping specified columns: {data.shape}")
+else:
+    print("Warning: No matching columns found to drop")
+    
+# Extra check to ensure Stock Price column is removed
+print("\nSpecific check for Stock Price column...")
+# Try explicit removal with the exact column name
+stock_price_col = 'Stock Price 2\r\nWeeks After\r\nOffer\r\n(USD)\r\n(Σ=Median)'
+if stock_price_col in data.columns:
+    print(f"Found exact match for stock price column: '{stock_price_col}'")
+    data.drop(columns=[stock_price_col], inplace=True)
+    print("Column dropped successfully!")
+else:
+    # Try to find it with a more flexible approach
+    potential_stock_cols = []
+    for col in data.columns:
+        # Check for keywords in the column name
+        if ('stock' in col.lower() and 'price' in col.lower() and 'week' in col.lower()) or \
+           ('stock' in col.lower() and 'after' in col.lower()) or \
+           ('week' in col.lower() and 'after' in col.lower() and 'offer' in col.lower()):
+            potential_stock_cols.append(col)
+    
+    if potential_stock_cols:
+        print(f"Found potential stock price columns: {potential_stock_cols}")
+        print("Dropping these columns...")
+        data.drop(columns=potential_stock_cols, inplace=True)
+        print("Columns dropped successfully!")
+    else:
+        print("WARNING: Could not identify the Stock Price column!")
+        print("Please check the dataset to ensure this column is removed.")
+
+# Show remaining columns for verification
+print("\nRemaining columns after all drops:")
+for col in data.columns:
+    print(f"- '{col}'")
+
+# 4. Handle missing values
+# First, check for missing values
+missing_values = data.isnull().sum()
+missing_cols = missing_values[missing_values > 0]
+if not missing_cols.empty:
+    print(f"Columns with missing values:\n{missing_cols}")
+else:
+    print("No missing values found in the dataset")
+
+# Fill missing values for numeric columns with median
+numeric_cols = data.select_dtypes(include=['number']).columns
+if not numeric_cols.empty:
+    data[numeric_cols] = data[numeric_cols].fillna(data[numeric_cols].median())
+
+# Fill missing values for categorical columns with mode
+categorical_cols = data.select_dtypes(include=['object']).columns
+for col in categorical_cols:
+    if data[col].isnull().sum() > 0:
+        data[col] = data[col].fillna(data[col].mode()[0])
+
+# 5. Create a copy of data for processing
+processed_data = data.copy()
+
+# 6. Handle categorical features
+# Identify categorical columns (excluding target)
+target_col = target_cols[0] if target_cols else "New underpricing classification"
+cat_cols = processed_data.select_dtypes(include=['object']).columns.tolist()
+print(f"Categorical columns: {cat_cols}")
+
+# One-hot encode categorical features
+if cat_cols:
+    processed_data = pd.get_dummies(processed_data, columns=cat_cols, drop_first=True)
+    print(f"Dataset shape after one-hot encoding: {processed_data.shape}")
+
+# 7. Drop low variance features
+# Drop low variance features (var < 0.01) except important ones
+try:
+    # Find the target column
+    target_col_pattern = "New.*underpricing.*classification"
+    target_cols = [col for col in processed_data.columns if re.search(target_col_pattern, col, re.IGNORECASE)]
+    
+    if target_cols:
+        target_col = target_cols[0]
+        protected_cols = ['15 day return', '30 day return', target_col]
+        
+        # Calculate variance for numeric columns only
+        numeric_cols = processed_data.select_dtypes(include=['number']).columns
+        if not numeric_cols.empty:
+            variances = processed_data[numeric_cols].var()
+            low_variance = variances[variances < 0.01].index
+            low_variance = [col for col in low_variance if col not in protected_cols]
+            
+            if low_variance:
+                print(f"Removing {len(low_variance)} low variance features: {low_variance}")
+                processed_data.drop(columns=low_variance, inplace=True)
+            else:
+                print("No low variance features found to remove")
+        else:
+            print("No numeric columns found to check variance")
+    else:
+        print("Target column not found for variance analysis")
+except Exception as e:
+    print(f"Error in variance analysis: {e}")
+    print("Skipping low variance feature removal")
+
+# 8. Train-Test Split
+# Find the target column (looking for variations of "New underpricing classification")
+target_col_pattern = "New.*underpricing.*classification"
+target_cols = [col for col in processed_data.columns if re.search(target_col_pattern, col, re.IGNORECASE)]
+
+if target_cols:
+    target_col = target_cols[0]
+    print(f"Using '{target_col}' as the target variable")
+else:
+    # Fallback to a default if not found
+    target_col = "New underpricing classification"
+    print(f"Warning: Target column not found. Using default name: '{target_col}'")
+
+try:
+    X = processed_data.drop(columns=[target_col])
+    y = processed_data[target_col]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    print(f"Train-test split successful. X_train shape: {X_train.shape}, X_test shape: {X_test.shape}")
+except Exception as e:
+    print(f"Error in train-test split: {e}")
+    raise
+
+# 9. Model Pipeline Setup - Single model with class weights
+print("\nSetting up model pipeline...")
+print(f"Target class distribution: {y_train.value_counts()}")
+
+# Random Forest pipeline with class weights
+model_pipeline = Pipeline([
+    ('scaler', StandardScaler()),  # Add scaling
+    ('classifier', RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42))
+])
+
+# 10. Cross-validation and Model Evaluation
+def evaluate_with_cv(pipeline, X, y, cv=5, scoring='balanced_accuracy'):
+    """Evaluate model with cross-validation"""
+    try:
+        cv_scores = cross_val_score(pipeline, X, y, cv=cv, scoring=scoring, error_score='raise')
+        print(f"Cross-validation {scoring}: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+        return cv_scores.mean()
+    except Exception as e:
+        print(f"Error during cross-validation: {str(e)}")
+        print("Returning default score of 0.0")
+        return 0.0
+
+# Define repeated stratified K-fold cross-validation
+cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=2, random_state=42)
+
+print("\nEvaluating model with cross-validation...")
+cv_score = evaluate_with_cv(model_pipeline, X_train, y_train, cv=cv)
+
+# 11. Hyperparameter Tuning
+print("\nPerforming hyperparameter tuning...")
+# Simplified parameter grid for faster execution in Datacamp
+param_grid = {
+    'classifier__n_estimators': list(range(50, 201, 10)),
+    'classifier__max_depth': list(range(5, 11)),
+    'classifier__min_samples_split': list(range(2, 11)),
+    'classifier__min_samples_leaf': list(range(1, 11)),
+    'classifier__max_features': ['sqrt', 'log2']
+}
+
+# Use n_jobs=1 to avoid potential issues in restricted environments like Datacamp
+grid_search = GridSearchCV(model_pipeline, param_grid, scoring='balanced_accuracy', cv=3, n_jobs=1)
+
+try:
+    grid_search.fit(X_train, y_train)
+    print(f"Best parameters: {grid_search.best_params_}")
+    print(f"Best cross-validation score: {grid_search.best_score_:.4f}")
+    
+    # 12. Final Model Training and Evaluation
+    print("\nTraining final model...")
+    final_model = grid_search.best_estimator_
+    final_model.fit(X_train, y_train)
+    
+    # Make predictions
+    y_pred = final_model.predict(X_test)
+    y_pred_proba = final_model.predict_proba(X_test)[:, 1]
+    
+    # 13. Evaluate on Test Set
+    print("\nFinal model evaluation on test set:")
+    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    print(f"Balanced Accuracy: {balanced_accuracy_score(y_test, y_pred):.4f}")
+    print(f"Precision: {precision_score(y_test, y_pred):.4f}")
+    print(f"Recall: {recall_score(y_test, y_pred):.4f}")
+    print(f"F1 Score: {f1_score(y_test, y_pred):.4f}")
+    print(f"ROC AUC: {roc_auc_score(y_test, y_pred_proba):.4f}")
+    
+    print("\nConfusion Matrix:")
+    conf_matrix = confusion_matrix(y_test, y_pred)
+    print(conf_matrix)
+    
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+    
+    # 14. Feature Importance Analysis
+    print("\nPerforming feature importance analysis...")
+    
+    # Extract the classifier from the pipeline
+    if hasattr(final_model, 'named_steps'):
+        clf = final_model.named_steps['classifier']
+    else:
+        clf = final_model
+    
+    # Method 1: Built-in feature importance
+    feature_importance = pd.DataFrame({
+        'Feature': X_train.columns,
+        'Importance': clf.feature_importances_
+    }).sort_values('Importance', ascending=False)
+    
+    print("\nTop 15 important features (built-in):")
+    print(feature_importance.head(15))
+    
+    # Method 2: Permutation importance (more reliable than built-in)
+    try:
+        print("\nCalculating permutation importance...")
+        perm_importance = permutation_importance(final_model, X_test, y_test, n_repeats=10, random_state=42)
+        perm_feature_importance = pd.DataFrame({
+            'Feature': X_train.columns,
+            'Importance': perm_importance.importances_mean
+        }).sort_values('Importance', ascending=False)
+        
+        print("\nTop 15 important features (permutation):")
+        print(perm_feature_importance.head(15))
+    except Exception as e:
+        print(f"Error in permutation importance calculation: {e}")
+    
+    # Method 3: SHAP values (if available)
+    if shap_available:
+        print("\nCalculating SHAP values...")
+        try:
+            # For the classifier in the pipeline
+            explainer = shap.TreeExplainer(clf)
+            
+            # Get feature names after all transformations
+            if hasattr(final_model, 'named_steps') and 'scaler' in final_model.named_steps:
+                # If we have a scaler in the pipeline, apply it to X_test
+                last_idx = list(final_model.named_steps.keys()).index('classifier')
+                transformed_X_test = X_test
+                for i, (name, transform) in enumerate(final_model.steps[:last_idx]):
+                    transformed_X_test = transform.transform(transformed_X_test)
+                
+                # Convert back to DataFrame with original feature names
+                if isinstance(transformed_X_test, np.ndarray):
+                    transformed_X_test = pd.DataFrame(transformed_X_test, columns=X_test.columns)
+            else:
+                transformed_X_test = X_test
+            
+            shap_values = explainer.shap_values(transformed_X_test)
+            
+            # Plot SHAP summary
+            plt.figure(figsize=(12, 8))
+            if isinstance(shap_values, list):
+                shap.summary_plot(shap_values[1], transformed_X_test, plot_type="bar", show=False)
+            else:
+                shap.summary_plot(shap_values, transformed_X_test, plot_type="bar", show=False)
+            
+            plt.title('SHAP Feature Importance')
+            plt.tight_layout()
+            plt.savefig('shap_feature_importance.png')
+            print("SHAP plot saved as 'shap_feature_importance.png'")
+            plt.close()
+            
+            # Also save detailed SHAP visualization
+            plt.figure(figsize=(12, 8))
+            if isinstance(shap_values, list):
+                shap.summary_plot(shap_values[1], transformed_X_test, show=False)
+            else:
+                shap.summary_plot(shap_values, transformed_X_test, show=False)
+            
+            plt.title('SHAP Feature Impact')
+            plt.tight_layout()
+            plt.savefig('shap_feature_impact.png')
+            print("SHAP impact plot saved as 'shap_feature_impact.png'")
+            plt.close()
+            
+        except Exception as e:
+            print(f"Error in SHAP analysis: {e}")
+    else:
+        print("\nSkipping SHAP analysis as the package is not available.")
+    
+    # 15. ROC Curve
+    try:
+        plt.figure(figsize=(10, 8))
+        fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+        plt.plot(fpr, tpr, label=f'Final Model (AUC = {roc_auc_score(y_test, y_pred_proba):.4f})')
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Curve')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig('roc_curve.png')
+        print("ROC curve saved as 'roc_curve.png'")
+        plt.close()
+    except Exception as e:
+        print(f"Error creating ROC curve: {e}")
+    
+    # 16. Feature Importance Visualization
+    try:
+        plt.figure(figsize=(12, 10))
+        sns.barplot(x='Importance', y='Feature', data=feature_importance.head(15))
+        plt.title('Random Forest Feature Importance (Built-in)')
+        plt.tight_layout()
+        plt.savefig('rf_feature_importance.png')
+        print("Feature importance plot saved as 'rf_feature_importance.png'")
+        plt.close()
+        
+        if 'perm_feature_importance' in locals():
+            plt.figure(figsize=(12, 10))
+            sns.barplot(x='Importance', y='Feature', data=perm_feature_importance.head(15))
+            plt.title('Permutation Feature Importance')
+            plt.tight_layout()
+            plt.savefig('permutation_feature_importance.png')
+            print("Permutation importance plot saved as 'permutation_feature_importance.png'")
+            plt.close()
+    except Exception as e:
+        print(f"Error creating feature importance plots: {e}")
+    
+    # 17. Save results to CSV
+    try:
+        results = pd.DataFrame({
+            'Metric': ['Accuracy', 'Balanced Accuracy', 'Precision', 'Recall', 'F1 Score', 'ROC AUC'],
+            'Value': [
+                accuracy_score(y_test, y_pred),
+                balanced_accuracy_score(y_test, y_pred),
+                precision_score(y_test, y_pred),
+                recall_score(y_test, y_pred),
+                f1_score(y_test, y_pred),
+                roc_auc_score(y_test, y_pred_proba)
+            ]
+        })
+        
+        results.to_csv('model_evaluation_results.csv', index=False)
+        feature_importance.to_csv('feature_importance.csv', index=False)
+        
+        if 'perm_feature_importance' in locals():
+            perm_feature_importance.to_csv('permutation_importance.csv', index=False)
+            
+        print("\nResults saved to CSV files.")
+    except Exception as e:
+        print(f"Error saving results to CSV: {e}")
+
+except Exception as e:
+    print(f"Error in hyperparameter tuning or model evaluation: {e}")
+
+print("\nScript complete.")
