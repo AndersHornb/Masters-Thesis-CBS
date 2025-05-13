@@ -1,0 +1,275 @@
+import pandas as pd
+import numpy as np
+import re
+import matplotlib.pyplot as plt
+import warnings
+import shap
+
+from joblib import parallel_backend
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer, make_column_selector as selector
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import (
+    train_test_split, StratifiedKFold, RandomizedSearchCV
+)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import (
+    classification_report, roc_curve, roc_auc_score,
+    confusion_matrix, precision_recall_curve, average_precision_score,
+    brier_score_loss, balanced_accuracy_score, matthews_corrcoef, cohen_kappa_score
+)
+from sklearn.calibration import calibration_curve
+
+# suppress warnings for encoding/empty features
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# 1. Feature Engineering: 
+numeric_cols = [
+    'Offer Price\n(USD)\n(σ=Median)',
+    'Proceeds\nAmount This\nMarket\n(USD, Millions)\n(σ=Com)',
+    'Financials:\nTotal\nRevenues\nBefore\nOffering\n(USD,\nMillions)\n(σ=Median)',
+    'Financials:\nNet Income\nAfter Taxes\nBefore\nOffering\n(USD,\nMillions)\n(σ=Median)',
+    '15 day return'
+]
+enh_feats = ['OfferPrice_log','Proceeds_log','ProfitMargin','MarketBull']
+
+def feature_engineer(df, medians=None):
+    df = df.copy()
+    for c in numeric_cols:
+        df[c] = pd.to_numeric(df.get(c, np.nan), errors='coerce')
+    df['OfferPrice_log'] = np.log1p(df[numeric_cols[0]].fillna(0))
+    df['Proceeds_log'] = np.log1p(df[numeric_cols[1]].fillna(0))
+    rev = df[numeric_cols[2]].replace(0, np.nan)
+    ni = df[numeric_cols[3]]
+    df['ProfitMargin'] = ni / rev
+    df['MarketBull'] = (df[numeric_cols[4]] > 0).astype(int)
+
+    fe_df = df[enh_feats].replace([np.inf, -np.inf], np.nan)
+    if medians is None:
+        medians = fe_df.median()
+    df[enh_feats] = fe_df.fillna(medians)
+    return df, medians
+
+class FeatureEngineer(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        self.drop_patterns = numeric_cols + ['Issuer/Borrower', 'Ticker.*Symbol',
+                                             'Book Or Co-Managers', 'Stock Price']
+        self.medians = None
+        self.feature_cols = None
+    def fit(self, X, y=None):
+        X2, self.medians = feature_engineer(X)
+        # drop raw numeric and unwanted cols
+        for pat in self.drop_patterns:
+            cols = [c for c in X2.columns if re.search(pat, c, re.IGNORECASE)]
+            X2.drop(columns=cols, inplace=True, errors='ignore')
+        self.feature_cols = X2.columns.tolist()
+        return self
+    def transform(self, X):
+        X2, _ = feature_engineer(X, medians=self.medians)
+        for pat in self.drop_patterns:
+            cols = [c for c in X2.columns if re.search(pat, c, re.IGNORECASE)]
+            X2.drop(columns=cols, inplace=True, errors='ignore')
+        # align columns
+        X2 = X2.reindex(columns=self.feature_cols, fill_value=np.nan)
+        return X2
+
+# 2. CategoryCleaner for unknown categories
+class CategoryCleaner(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        self.categories_ = {col: set(X[col].dropna().unique()) for col in X.columns}
+        return self
+    def transform(self, X):
+        X2 = X.copy()
+        for col, cats in self.categories_.items():
+            X2.loc[~X2[col].isin(cats), col] = np.nan
+        return X2
+
+# 3. Load and split data
+def load_data(path, sheet_name="Sheet1 (2)"):
+    df = pd.read_excel("MLModels3.xlsx", sheet_name=sheet_name)
+    df = df.dropna(axis=1, how='all')
+    df = df.loc[:, ~df.columns.str.startswith('Unnamed')]
+    y = df.filter(regex='Underpriced', axis=1).iloc[:,0]
+    X = df.drop(columns=y.name).copy()
+    return X, y
+
+X, y = load_data("MLModels3.xlsx")
+X_tr, X_te, y_tr, y_te = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# 4. Build preprocessing & model pipeline
+preprocessor = ColumnTransformer([
+    ('num', Pipeline([
+        ('imp', SimpleImputer(strategy='median')),
+        ('scale', StandardScaler())
+    ]), selector(dtype_include=np.number)),
+
+    ('cat', Pipeline([
+        ('clean', CategoryCleaner()),
+        ('imp', SimpleImputer(strategy='constant', fill_value='Unknown')),
+        ('ohe', OneHotEncoder(drop='first', handle_unknown='infrequent_if_exist',
+                              sparse_output=False, min_frequency=1))
+    ]), selector(dtype_include=object))
+], remainder='drop')
+
+to_dense = FunctionTransformer(lambda arr: arr.toarray() if hasattr(arr, 'toarray') else arr, validate=False)
+
+pipeline = Pipeline([
+    ('fe', FeatureEngineer()),
+    ('prep', preprocessor),
+    ('dense', to_dense),
+    ('clf', RandomForestClassifier(
+        class_weight='balanced', random_state=42, n_jobs=1
+    ))
+])
+
+# 5. Hyperparameter search
+param_dist = {
+    'clf__n_estimators': [100, 250, 500],
+    'clf__max_depth': [None, 5, 10, 20],
+    'clf__min_samples_split': [2, 5, 10],
+    'clf__min_samples_leaf': [1, 2, 4],
+    'clf__max_features': ['sqrt', 'log2']
+}
+search = RandomizedSearchCV(
+    pipeline, param_distributions=param_dist,
+    n_iter=30, cv=StratifiedKFold(3, shuffle=True, random_state=42),
+    scoring='f1', n_jobs=-1, verbose=2, random_state=42, error_score='raise', refit=True
+)
+
+# 6. Fit and evaluate
+print("Running RandomizedSearchCV...")
+with parallel_backend('threading'):
+    search.fit(X_tr, y_tr)
+
+best = search.best_estimator_
+print(f"Best params: {search.best_params_}")
+
+# Predictions & metrics
+pred = best.predict(X_te)
+prob = best.predict_proba(X_te)[:,1]
+print(classification_report(y_te, pred))
+cm = confusion_matrix(y_te, pred)
+print("Confusion Matrix:\n", cm)
+# ROC
+fpr, tpr, _ = roc_curve(y_te, prob)
+plt.figure(); plt.plot(fpr, tpr, label=f'AUC={roc_auc_score(y_te,prob):.3f}');
+plt.plot([0,1],[0,1],'k--'); plt.title('ROC Curve'); plt.xlabel('FPR'); plt.ylabel('TPR'); plt.legend(); plt.show()
+# Precision-Recall
+prec, rec, _ = precision_recall_curve(y_te, prob)
+ap = average_precision_score(y_te, prob)
+plt.figure(); plt.step(rec, prec, where='post'); plt.title(f'Precision-Recall (AP={ap:.3f})'); plt.xlabel('Recall'); plt.ylabel('Precision'); plt.show()
+# Calibration & Brier
+frac_pos, mean_pred = calibration_curve(y_te, prob, n_bins=10)
+plt.figure(); plt.plot(mean_pred, frac_pos, marker='o'); plt.plot([0,1],[0,1],'k--');
+plt.title('Calibration Curve'); plt.xlabel('Mean Pred'); plt.ylabel('Frac Positives'); plt.show()
+print("Brier score:", brier_score_loss(y_te, prob))
+# Additional metrics
+print("Balanced accuracy:", balanced_accuracy_score(y_te, pred))
+print("Matthews corrcoef:", matthews_corrcoef(y_te, pred))
+print("Cohen's kappa:", cohen_kappa_score(y_te, pred))
+
+# 7. Permutation importance
+fe = best.named_steps['fe']
+X_te_feats = fe.transform(X_te)
+ct = best.named_steps['prep']
+num_cols = ct.transformers_[0][2]
+cat_cols = ct.transformers_[1][2]
+ohe = ct.named_transformers_['cat'].named_steps['ohe']
+cat_ohe_cols = ohe.get_feature_names_out(cat_cols).tolist()
+feature_names = list(num_cols) + cat_ohe_cols
+X_te_full = pd.DataFrame(X_te_feats, columns=feature_names)
+perm = permutation_importance(best, X_te_full, y_te, n_repeats=5, n_jobs=-1, random_state=42)
+imp_df = pd.Series(perm.importances_mean, index=feature_names).sort_values(ascending=False)
+print("Top permutation importances:\n", imp_df.nlargest(15))
+
+import shap
+
+# -------------------------------
+# 8. SHAP explanation for Random Forest
+# -------------------------------
+print("Calculating SHAP values for RF…")
+
+# 1) Build “preprocess only” pipeline (fe → prep → dense)
+preprocess = Pipeline(best.steps[:-1])
+
+# 2) Apply to test set
+X_shap = preprocess.transform(X_te)
+
+# 3) Grab your ColumnTransformer
+ct = best.named_steps['prep']
+
+# 4) Extract numeric & categorical input names
+#    transformers_[i][2] holds the original col list that went into each transformer
+num_cols = ct.transformers_[0][2]
+cat_cols = ct.transformers_[1][2]
+
+# 5) Expand categorical names via the fitted OneHotEncoder
+ohe = ct.named_transformers_['cat'].named_steps['ohe']
+cat_ohe_names = ohe.get_feature_names_out(cat_cols)
+
+# 6) Combine into final feature list & align to X_shap width
+feature_names = list(num_cols) + list(cat_ohe_names)
+n_cols = X_shap.shape[1]
+if len(feature_names) != n_cols:
+    print(f"Aligning names: data has {n_cols} cols, but {len(feature_names)} names.")
+    if len(feature_names) > n_cols:
+        feature_names = feature_names[:n_cols]
+    else:
+        feature_names += [f"extra_{i}" for i in range(len(feature_names), n_cols)]
+
+# 7) Wrap into a DataFrame so SHAP picks up the column names
+X_shap_df = pd.DataFrame(X_shap, columns=feature_names)
+
+# 8) Compute SHAP values
+clf         = best.named_steps['clf']
+explainer   = shap.TreeExplainer(clf)
+shap_values = explainer.shap_values(X_shap_df)
+
+if isinstance(shap_values, list):
+    shap_values = shap_values[1]
+elif hasattr(shap_values, "ndim") and shap_values.ndim == 3:
+    shap_values = shap_values[:, :, 1]
+
+# 9) Save raw SHAP matrix to CSV
+pd.DataFrame(shap_values, columns=feature_names) \
+  .to_csv("shap_rf_values.csv", index=False)
+print("Saved raw SHAP values to shap_rf_values.csv")
+
+
+# 9) Save raw SHAP matrix to CSV
+pd.DataFrame(shap_values, columns=feature_names) \
+  .to_csv("shap_rf_values.csv", index=False)
+print("Saved raw SHAP values to shap_rf_values.csv")
+
+# 10) Global importance (bar plot)
+plt.figure(figsize=(10,7))
+shap.summary_plot(shap_values, X_shap_df, plot_type="bar", show=False)
+plt.tight_layout()
+plt.savefig("shap_rf_feature_importance.png")
+plt.close()
+
+# 11) Beeswarm (impact) plot
+plt.figure(figsize=(10,7))
+shap.summary_plot(shap_values, X_shap_df, show=False)
+plt.tight_layout()
+plt.savefig("shap_rf_summary_beeswarm.png")
+plt.close()
+
+print("SHAP plots saved as 'shap_rf_feature_importance.png' and 'shap_rf_summary_beeswarm.png'")
+
+
+# 8. Save feature variances
+num_feats = X_te_full.select_dtypes(include=[np.number]).columns
+train_feats = fe.transform(X_tr)
+X_tr_full = pd.DataFrame(train_feats, columns=feature_names)
+var_df = pd.DataFrame({
+    'train_var': X_tr_full[num_feats].var(),
+    'test_var': X_te_full[num_feats].var()
+})
+var_df.to_csv("feature_variances_rf.csv")
+
